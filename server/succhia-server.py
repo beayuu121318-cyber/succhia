@@ -1,9 +1,13 @@
-import json, os, time, threading
+import json, os, time, threading, hmac
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 import pathlib
+ROOT = pathlib.Path(__file__).resolve().parent.parent
 STATE_FILE = str(pathlib.Path(__file__).parent / "succhia-state.json")
+WEB_FILE = ROOT / "web" / "succhia.html"
+TOKEN = os.environ.get("SUCCHIA_TOKEN", "").strip()
+PORT = int(os.environ.get("PORT", "8889"))
 
 CHANNELS = ("suck","vibe","ems")
 NO_PATTERNS = {"suck":None,"vibe":None,"ems":None}
@@ -59,11 +63,34 @@ def diag_add(ev):
 class PH(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def _authorized(self, query=None):
+        if not TOKEN:
+            return True
+        auth = self.headers.get("Authorization", "")
+        query_token = (query or {}).get("token", [""])[0]
+        return hmac.compare_digest(auth, "Bearer " + TOKEN) or hmac.compare_digest(query_token, TOKEN)
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+    def _html(self):
+        try:
+            body = WEB_FILE.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as e:
+            self._json({"error": "control page unavailable", "detail": str(e)}, 500)
+
     def _json(self, obj, code=200):
         body = json.dumps(obj).encode()
         self.send_response(code)
         self.send_header("Content-Type","application/json")
-        self.send_header("Access-Control-Allow-Origin","*")
+        self._cors()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         try: self.wfile.write(body)
@@ -72,6 +99,12 @@ class PH(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
+        if u.path in ("/", "/succhia.html"):
+            return self._html()
+        if u.path == "/health":
+            return self._json({"ok": True})
+        if not self._authorized(q):
+            return self._json({"error": "unauthorized"}, 401)
         if u.path == "/poll":
             arrived = time.time()
             LAST_POLL[0] = arrived
@@ -125,7 +158,11 @@ class PH(BaseHTTPRequestHandler):
             self._json({"error":"not found"}, 404)
 
     def do_POST(self):
-        if urlparse(self.path).path == "/set":
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if not self._authorized(q):
+            return self._json({"error": "unauthorized"}, 401)
+        if u.path == "/set":
             length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(length)
             try:
@@ -157,14 +194,13 @@ class PH(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin","*")
+        self._cors()
         self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers","Content-Type")
         self.send_header("Content-Length","0")
         self.end_headers()
     def log_message(self,f,*a): pass
 
-print("Succhia poll server (threading+longpoll) starting on :8889...")
-srv = ThreadingHTTPServer(("0.0.0.0",8889), PH)
+print(f"Succhia server starting on :{PORT}...")
+srv = ThreadingHTTPServer(("0.0.0.0", PORT), PH)
 srv.daemon_threads = True
 srv.serve_forever()
