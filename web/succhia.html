@@ -141,8 +141,15 @@ button{cursor:pointer}
 const _q=new URLSearchParams(location.search);
 if(_q.get('server'))try{localStorage.setItem('succhia_server',_q.get('server'));}catch(_){}
 if(_q.get('chat')!==null)try{localStorage.setItem('succhia_chat',_q.get('chat'));}catch(_){}
-const BASE_URL=(()=>{try{return localStorage.getItem('succhia_server')||"http://localhost:8889";}catch(_){return "http://localhost:8889";}})();
+if(_q.get('token'))try{localStorage.setItem('succhia_token',_q.get('token'));}catch(_){}
+const BASE_URL=(()=>{try{return localStorage.getItem('succhia_server')||location.origin;}catch(_){return location.origin;}})();
 const CHAT_URL=(()=>{try{return localStorage.getItem('succhia_chat')||"";}catch(_){return "";}})();
+const AUTH_TOKEN=(()=>{try{return localStorage.getItem('succhia_token')||"";}catch(_){return "";}})();
+function apiFetch(url,opts={}){
+  const headers=new Headers(opts.headers||{});
+  if(AUTH_TOKEN)headers.set('Authorization','Bearer '+AUTH_TOKEN);
+  return fetch(url,{...opts,headers});
+}
 const POLL_URL = BASE_URL + "/poll";
 const SVC = "0000ee01-0000-1000-8000-00805f9b34fb";
 const CHR_W = "0000ee03-0000-1000-8000-00805f9b34fb";
@@ -458,7 +465,7 @@ function schedulePush(){
     if(patDirty.size){body.patterns={};for(const ch of patDirty)body.patterns[ch]=state.patterns[ch];}
     dirty.clear();patDirty.clear();
     if(!Object.keys(body).length)return;
-    fetch(BASE_URL+'/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),keepalive:true}).catch(()=>{});
+    apiFetch(BASE_URL+'/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),keepalive:true}).catch(()=>{});
   },250);
 }
 function manualSet(ch,val){
@@ -574,7 +581,7 @@ async function pollLoop(gen){
     try{
       pollAbort=new AbortController();
       const url=since==null?POLL_URL:POLL_URL+'?wait=20&since='+encodeURIComponent(since);
-      const r=await fetch(url,{signal:pollAbort.signal,cache:'no-store'});
+      const r=await apiFetch(url,{signal:pollAbort.signal,cache:'no-store'});
       const d=await r.json();
       if(gen!==pollGen)return;
       since=d.updated_at;
@@ -595,10 +602,10 @@ function stopPoll(){
   try{if(pollAbort)pollAbort.abort();}catch(_){}
 }
 async function pollQuick(){ // 一次性快速对账(BLE 通知唤醒等场景)
-  try{const r=await fetch(POLL_URL,{cache:'no-store'});applyState(await r.json());}catch(_){}
+  try{const r=await apiFetch(POLL_URL,{cache:'no-store'});applyState(await r.json());}catch(_){}
 }
 function pageEvent(t){ // 诊断埋点:帮我们看清 iOS 后台到底发生了什么
-  try{fetch(BASE_URL+'/event?type='+t,{keepalive:true,cache:'no-store'}).catch(()=>{});}catch(_){}
+  try{apiFetch(BASE_URL+'/event?type='+t,{keepalive:true,cache:'no-store'}).catch(()=>{});}catch(_){}
 }
 </script>
 </body>
