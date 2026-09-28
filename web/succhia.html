@@ -36,6 +36,19 @@ html,body{margin:0;height:100%;overflow:hidden;background:var(--bg,#1a1a2e);colo
   padding:14px 18px 22px;max-width:480px;margin:0 auto}
 body.panel #scrim{opacity:1;pointer-events:auto}
 body.panel #sheet{transform:translateY(0)}
+/* 没有聊天前端时，控制面板直接作为全屏主界面 */
+body.standalone{overflow:hidden}
+body.standalone #chatFrame,
+body.standalone #ball,
+body.standalone #scrim,
+body.standalone .sh-x{display:none!important}
+body.standalone #sheet{
+  inset:0;box-sizing:border-box;transform:none!important;transition:none;
+  max-width:none;margin:0;border:0;border-radius:0;box-shadow:none;
+  padding:max(20px,env(safe-area-inset-top)) 20px max(24px,env(safe-area-inset-bottom));
+  overflow-y:auto;background:var(--bg,#1a1a2e)
+}
+body.standalone .sh-title{font-size:22px}
 .sh-head{display:flex;align-items:center;gap:10px;margin-bottom:2px}
 .sh-eyebrow{font-size:10px;letter-spacing:.18em;color:var(--text-dim,#888);text-transform:uppercase}
 .sh-title{font-size:15px;font-weight:600;color:var(--text-strong,#fff);flex:1}
@@ -128,7 +141,7 @@ button{cursor:pointer}
   </div>
 
   <button class="stop-btn" onclick="stopAll()">全部停止</button>
-  <div class="hint">连接后自动防熄屏 · 聊天就在这页，别切去别的 app</div>
+  <div class="hint">连接后自动防熄屏 · 请保持此页面开启</div>
 </div>
 
 <script>
@@ -184,20 +197,28 @@ document.querySelector('.sh-x').innerHTML=IC.x;
 document.querySelectorAll('[data-ic]').forEach(el=>{el.innerHTML=IC[el.dataset.ic];});
 
 function openPanel(){document.body.classList.add('panel');pageEvent('panel_open');}
-function closePanel(){document.body.classList.remove('panel');}
+function closePanel(){
+  if(document.body.classList.contains('standalone'))return;
+  document.body.classList.remove('panel');
+}
 
 // 小球日常隐身:聊天 ➕ 面板「玩具控制」召出/收起;隐身不影响蓝牙(连接与轮询照常)
 function ballVisible(){return ball.classList.contains('vis');}
 function setBallVis(on,openToo){
+  if(document.body.classList.contains('standalone')){ball.classList.remove('vis');return;}
   ball.classList.toggle('vis',!!on);
   if(on&&openToo)openPanel();
   if(!on)closePanel();
   try{localStorage.setItem('succhia_ball_vis',on?'1':'0');}catch(_){}
 }
-if(CHAT_URL)document.getElementById('chatFrame').src=CHAT_URL;
-else document.getElementById('chatFrame').style.display='none';
-// 无聊天融合时小球常驻;有聊天时按记忆显隐(聊天页 ➕ 面板 postMessage 'succhia:toggle' 可召/收)
-if(!CHAT_URL||(()=>{try{return localStorage.getItem('succhia_ball_vis')==='1';}catch(_){return false;}})())setBallVis(true,false);
+if(CHAT_URL){
+  document.getElementById('chatFrame').src=CHAT_URL;
+}else{
+  document.getElementById('chatFrame').style.display='none';
+  document.body.classList.add('standalone','panel');
+}
+// 有聊天前端时才使用悬浮球；独立模式直接显示全屏控制面板
+if(CHAT_URL&&(()=>{try{return localStorage.getItem('succhia_ball_vis')==='1';}catch(_){return false;}})())setBallVis(true,false);
 window.addEventListener('message',e=>{
   if(e.origin!==location.origin)return;
   if(e.data==='succhia:toggle')setBallVis(!ballVisible(),true);
