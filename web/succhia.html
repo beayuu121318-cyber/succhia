@@ -141,7 +141,11 @@ button{cursor:pointer}
 const _q=new URLSearchParams(location.search);
 if(_q.get('server'))try{localStorage.setItem('succhia_server',_q.get('server'));}catch(_){}
 if(_q.get('chat')!==null)try{localStorage.setItem('succhia_chat',_q.get('chat'));}catch(_){}
-if(_q.get('token'))try{localStorage.setItem('succhia_token',_q.get('token'));}catch(_){}
+if(_q.get('token')){
+  try{localStorage.setItem('succhia_token',_q.get('token'));}catch(_){}
+  _q.delete('token');
+  try{history.replaceState(null,'',location.pathname+(_q.toString()?'?'+_q.toString():'')+location.hash);}catch(_){}
+}
 const BASE_URL=(()=>{try{return localStorage.getItem('succhia_server')||location.origin;}catch(_){return location.origin;}})();
 const CHAT_URL=(()=>{try{return localStorage.getItem('succhia_chat')||"";}catch(_){return "";}})();
 const AUTH_TOKEN=(()=>{try{return localStorage.getItem('succhia_token')||"";}catch(_){return "";}})();
