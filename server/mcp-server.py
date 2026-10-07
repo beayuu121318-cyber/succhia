@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import html
 import json
 import os
@@ -8,6 +10,8 @@ import time
 import urllib.error
 import urllib.request
 from typing import Annotated, Any, Literal
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from mcp.server.auth.provider import (
     AccessToken,
@@ -114,67 +118,138 @@ def _require_phone() -> None:
 
 
 class KaraOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]):
+    """Restart-safe OAuth storage using authenticated, encrypted self-contained values."""
+
+    STATE_TTL = 10 * 60
+    CODE_TTL = 5 * 60
+    TOKEN_TTL = 60 * 60 * 24 * 30
+
     def __init__(self) -> None:
-        self.clients: dict[str, OAuthClientInformationFull] = {}
-        self.auth_codes: dict[str, AuthorizationCode] = {}
-        self.tokens: dict[str, AccessToken] = {}
-        self.states: dict[str, dict[str, str | None]] = {}
+        digest = hashlib.sha256(("bobobei-oauth-v2\0" + LOGIN_PASSWORD).encode("utf-8")).digest()
+        self._box = Fernet(base64.urlsafe_b64encode(digest))
+
+    def _seal(self, kind: str, data: dict[str, Any]) -> str:
+        payload = json.dumps(
+            {"kind": kind, "data": data},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return f"{kind}.{self._box.encrypt(payload).decode('ascii')}"
+
+    def _open(self, value: str, kind: str, ttl: int | None = None) -> dict[str, Any] | None:
+        try:
+            prefix, encrypted = value.split(".", 1)
+            if prefix != kind:
+                return None
+            payload = json.loads(self._box.decrypt(encrypted.encode("ascii"), ttl=ttl).decode("utf-8"))
+            if payload.get("kind") != kind or not isinstance(payload.get("data"), dict):
+                return None
+            return payload["data"]
+        except (InvalidToken, UnicodeError, ValueError, KeyError, json.JSONDecodeError):
+            return None
+
+    def open_state(self, state: str) -> dict[str, Any] | None:
+        return self._open(state, "state", self.STATE_TTL)
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        return self.clients.get(client_id)
+        data = self._open(client_id, "client")
+        if not data:
+            return None
+        try:
+            client = OAuthClientInformationFull.model_validate(data)
+            client.client_id = client_id
+            return client
+        except ValueError:
+            return None
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         if not client_info.client_id:
             raise ValueError("client_id is required")
-        self.clients[client_info.client_id] = client_info
+        # RegistrationHandler returns this same model, so replacing the generated
+        # UUID here gives ChatGPT a client record that survives Render restarts.
+        client_info.client_id = self._seal("client", client_info.model_dump(mode="json"))
 
     async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
-        state = params.state or secrets.token_urlsafe(24)
-        self.states[state] = {
-            "redirect_uri": str(params.redirect_uri),
-            "code_challenge": params.code_challenge,
-            "redirect_uri_provided_explicitly": str(params.redirect_uri_provided_explicitly),
-            "client_id": client.client_id,
-            "resource": params.resource,
-        }
+        oauth_state = params.state or secrets.token_urlsafe(24)
+        state = self._seal(
+            "state",
+            {
+                "oauth_state": oauth_state,
+                "redirect_uri": str(params.redirect_uri),
+                "code_challenge": params.code_challenge,
+                "redirect_uri_provided_explicitly": bool(params.redirect_uri_provided_explicitly),
+                "client_id": client.client_id,
+                "resource": params.resource,
+            },
+        )
         return f"{PUBLIC_URL}/login?state={state}"
 
-    async def load_authorization_code(self, client: OAuthClientInformationFull, authorization_code: str) -> AuthorizationCode | None:
-        return self.auth_codes.get(authorization_code)
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        data = self._open(authorization_code, "code", self.CODE_TTL)
+        if not data:
+            return None
+        try:
+            code = AuthorizationCode.model_validate({**data, "code": authorization_code})
+            if code.client_id != client.client_id or code.expires_at < time.time():
+                return None
+            return code
+        except ValueError:
+            return None
 
-    async def exchange_authorization_code(self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode) -> OAuthToken:
-        if authorization_code.code not in self.auth_codes or not client.client_id:
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        if not client.client_id or authorization_code.client_id != client.client_id:
             raise ValueError("invalid authorization code")
-        token = "bb_" + secrets.token_urlsafe(36)
-        self.tokens[token] = AccessToken(
-            token=token,
+        expires_at = int(time.time()) + self.TOKEN_TTL
+        token_data = AccessToken(
+            token="placeholder",
             client_id=client.client_id,
             scopes=authorization_code.scopes,
-            expires_at=int(time.time()) + 60 * 60 * 24 * 30,
+            expires_at=expires_at,
             resource=authorization_code.resource,
             subject=authorization_code.subject,
         )
-        del self.auth_codes[authorization_code.code]
-        return OAuthToken(access_token=token, token_type="Bearer", expires_in=60 * 60 * 24 * 30, scope=" ".join(authorization_code.scopes))
+        token = self._seal("access", token_data.model_dump(mode="json", exclude={"token"}))
+        return OAuthToken(
+            access_token=token,
+            token_type="Bearer",
+            expires_in=self.TOKEN_TTL,
+            scope=" ".join(authorization_code.scopes),
+        )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        access_token = self.tokens.get(token)
-        if access_token and (not access_token.expires_at or access_token.expires_at >= time.time()):
+        data = self._open(token, "access", self.TOKEN_TTL)
+        if not data:
+            return None
+        try:
+            access_token = AccessToken.model_validate({**data, "token": token})
+            if access_token.expires_at and access_token.expires_at < time.time():
+                return None
             return access_token
-        self.tokens.pop(token, None)
+        except ValueError:
+            return None
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
         return None
 
-    async def load_refresh_token(self, client: OAuthClientInformationFull, refresh_token: str) -> RefreshToken | None:
-        return None
-
-    async def exchange_refresh_token(self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]) -> OAuthToken:
+    async def exchange_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: RefreshToken, scopes: list[str]
+    ) -> OAuthToken:
         raise NotImplementedError("refresh tokens are not supported")
 
     async def revoke_token(self, token: str, token_type_hint: str | None = None) -> None:  # type: ignore[override]
-        self.tokens.pop(token, None)
+        # Revocation is not advertised. Access tokens naturally expire after 30 days;
+        # changing the login password invalidates every sealed credential immediately.
+        return None
 
     def issue_code(self, username: str, password: str, state: str) -> str:
-        data = self.states.get(state)
+        data = self.open_state(state)
         if not data:
             raise HTTPException(400, "登录链接已过期，请返回 ChatGPT 重试。")
         if not secrets.compare_digest(username, LOGIN_USER) or not secrets.compare_digest(password, LOGIN_PASSWORD):
@@ -182,27 +257,27 @@ class KaraOAuthProvider(OAuthAuthorizationServerProvider[AuthorizationCode, Refr
         redirect_uri = data["redirect_uri"]
         client_id = data["client_id"]
         challenge = data["code_challenge"]
-        assert redirect_uri and client_id and challenge
-        code = "bbc_" + secrets.token_urlsafe(24)
-        self.auth_codes[code] = AuthorizationCode(
-            code=code,
+        oauth_state = data["oauth_state"]
+        assert redirect_uri and client_id and challenge and oauth_state
+        expires_at = time.time() + self.CODE_TTL
+        code_data = AuthorizationCode(
+            code="placeholder",
             client_id=client_id,
             redirect_uri=AnyHttpUrl(redirect_uri),
-            redirect_uri_provided_explicitly=data["redirect_uri_provided_explicitly"] == "True",
-            expires_at=time.time() + 300,
+            redirect_uri_provided_explicitly=bool(data["redirect_uri_provided_explicitly"]),
+            expires_at=expires_at,
             scopes=["bobobei"],
             code_challenge=challenge,
             resource=data.get("resource"),
             subject=username,
         )
-        del self.states[state]
-        return construct_redirect_uri(redirect_uri, code=code, state=state)
-
+        code = self._seal("code", code_data.model_dump(mode="json", exclude={"code"}))
+        return construct_redirect_uri(redirect_uri, code=code, state=oauth_state)
 
 oauth = KaraOAuthProvider()
 mcp = MCPServer(
     "bobobei",
-    version="1.1.0",
+    version="1.2.0",
     instructions=(
         "Controls Kara's paired 啵啵贝 through her Android Chrome bridge. Read status before increasing intensity. "
         "Use conservative values unless Kara explicitly requests otherwise. Never guess consent or continue after Kara asks to stop."
@@ -219,13 +294,13 @@ mcp = MCPServer(
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_: Request) -> JSONResponse:
-    return JSONResponse({"ok": True, "service": "bobobei-mcp", "version": "1.1.0", "auth": "oauth"})
+    return JSONResponse({"ok": True, "service": "bobobei-mcp", "version": "1.2.0", "auth": "oauth"})
 
 
 @mcp.custom_route("/login", methods=["GET"])
 async def login_page(request: Request) -> HTMLResponse:
     state = request.query_params.get("state")
-    if not state or state not in oauth.states:
+    if not state or oauth.open_state(state) is None:
         raise HTTPException(400, "登录链接已过期，请返回 ChatGPT 重试。")
     safe_state = html.escape(state, quote=True)
     safe_user = html.escape(LOGIN_USER, quote=True)

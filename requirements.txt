@@ -1,3 +1,4 @@
 mcp>=2.0.0,<3
 uvicorn>=0.35.0,<1
 python-multipart>=0.0.20,<1
+cryptography>=46.0.0,<47
